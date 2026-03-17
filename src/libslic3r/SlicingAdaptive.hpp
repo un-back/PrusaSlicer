@@ -3,6 +3,14 @@
 ///|/ PrusaSlicer is released under the terms of the AGPLv3 or higher
 ///|/
 // Based on implementation by @platsch
+//
+// Adaptive layer height algorithm:
+//   For each mesh triangle, the maximum allowable layer height is computed from the
+//   triangle's surface slope so that the "stairstepping" surface roughness stays
+//   below a user-chosen threshold (the quality factor).  Steeper faces require
+//   thinner layers; near-horizontal faces allow thicker layers.
+//
+// See doc/AdaptiveLayerHeight.md for a full description of the algorithm.
 
 #ifndef slic3r_SlicingAdaptive_hpp_
 #define slic3r_SlicingAdaptive_hpp_
@@ -26,24 +34,33 @@ class SlicingAdaptive
 public:
     void  clear();
     void  set_slicing_parameters(SlicingParameters params) { m_slicing_params = params; }
+    // Collect all mesh triangles and sort them by their Z-span for fast per-layer queries.
     void  prepare(const ModelObject &object);
-    // Return next layer height starting from the last print_z, using a quality measure
-    // (quality in range from 0 to 1, 0 - highest quality at low layer heights, 1 - lowest print quality at high layer heights).
-    // The layer height curve shall be centered roughly around the default profile's layer height for quality 0.5.
-	float next_layer_height(const float print_z, float quality, size_t &current_facet);
+    // Return the height of the next layer whose bottom is at print_z.
+    // quality_factor is in [0, 1]: 0 = highest quality (thinnest layers),
+    //                              0.5 = default layer height,
+    //                              1 = lowest quality (thickest layers, fastest print).
+    // current_facet is an in/out index into the sorted face list; it is advanced on each
+    // call so that successive calls start scanning from where the previous one left off.
+	float next_layer_height(const float print_z, float quality_factor, size_t &current_facet);
+    // Returns the Z-distance to the next perfectly horizontal facet above z,
+    // used to align layer boundaries with flat surface features.
     float horizontal_facet_distance(float z);
 
+    // Per-face data extracted from the mesh and used by the adaptive algorithm.
 	struct FaceZ {
+        // Minimum and maximum Z coordinates of the triangle's three vertices.
 		std::pair<float, float> z_span;
-		// Cosine of the normal vector towards the Z axis.
+        // |normal.z| – how "horizontal" the face is (1 = flat top, 0 = vertical wall).
 		float					n_cos;
-		// Sine of the normal vector towards the Z axis.
+        // sqrt(normal.x² + normal.y²) – how "steep" the face is (0 = flat, 1 = vertical).
 		float					n_sin;
 	};
 
 protected:
 	SlicingParameters 		m_slicing_params;
 
+    // Triangles sorted lexicographically by (z_span.first, z_span.second).
 	std::vector<FaceZ>		m_faces;
 };
 
