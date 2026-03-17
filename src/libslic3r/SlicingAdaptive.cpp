@@ -27,21 +27,17 @@
 // Adaptive Slicing for the FDM Process Revisited
 // 13th IEEE Conference on Automation Science and Engineering (CASE-2017), August 20-23, Xi'an, China. DOI: 10.1109/COASE.2017.8256074
 // https://tams.informatik.uni-hamburg.de/publications/2017/Adaptive%20Slicing%20for%20the%20FDM%20Process%20Revisited.pdf
-
-// Vojtech believes that there is a bug in @platch's derivation of the triangle area error metric.
-// Following Octave code paints graphs of recommended layer height versus surface slope angle.
-#if 0
-adeg=0:1:85;
-a=adeg*pi/180;
-t=tan(a);
-tsqr=sqrt(tan(a));
-lerr=1./cos(a);
-lerr2=1./(0.3+cos(a));
-plot(adeg, t, 'b', adeg, sqrt(t), 'g', adeg, 0.5 * lerr, 'm', adeg, 0.5 * lerr2, 'r')
-xlabel("angle(deg), 0 - horizontal wall, 90 - vertical wall");
-ylabel("layer height");
-legend("tan(a) as cura - topographic lines distance limit", "sqrt(tan(a)) as PrusaSlicer - error triangle area limit", "old slic3r - max distance metric", "new slic3r - Waserfall paper");
-#endif
+//
+// Core idea: choose the layer height H for each layer such that the surface roughness
+// ("stairstepping") stays below a constant target across the whole model.
+// Steeper faces need thinner layers; near-horizontal faces can use thicker layers.
+// The allowed layer height for a face with slope angle α (measured from horizontal) is:
+//
+//   H = f(max_surface_deviation, n_cos, n_sin)
+//
+// where n_cos = |normal.z| and n_sin = sqrt(normal.x²+normal.y²).
+// Multiple candidate formulas exist (see layer_height_from_slope below); PrusaSlicer
+// currently uses the "constant error triangle area" metric by Vojtech.
 
 namespace Slic3r
 {
@@ -59,22 +55,35 @@ namespace Slic3r
 // Currenty @platch's error metric formula is not used.
 //static constexpr const double SURFACE_CONST = 0.18403;
 
-// for a given facet, compute maximum height within the allowed surface roughness / stairstepping deviation
+// for a given facet, compute maximum layer height within the allowed surface roughness.
+// max_surface_deviation is derived from the quality factor and the min/max layer height
+// configured for this printer; see next_layer_height() for how it is computed.
+//
+// Several candidate formulas are shown below (commented out) for reference.
+// The currently active one (Vojtech's triangle area metric with a 90° clamp) gives a
+// good visual result on a wide range of models.
 static inline float layer_height_from_slope(const SlicingAdaptive::FaceZ &face, float max_surface_deviation)
 {
-// @platch's formula, see his paper "Adaptive Slicing for the FDM Process Revisited".
+// @platch's formula from "Adaptive Slicing for the FDM Process Revisited".
+// Accounts for the volumetric error of stacked elliptic extrusion threads
+// (SURFACE_CONST ≈ 0.184 was measured empirically on printed parts).
 //    return float(max_surface_deviation / (SURFACE_CONST + 0.5 * std::abs(normal_z)));
 	
-// Constant stepping in horizontal direction, as used by Cura.
+// Constant stepping in horizontal direction ("topographic lines" spacing), as used by Cura.
+// H = max_surface_deviation × (n_sin / n_cos) = max_surface_deviation × tan(α)
 //    return (face.n_cos > 1e-5) ? float(max_surface_deviation * face.n_sin / face.n_cos) : FLT_MAX;
 
 // Constant error measured as an area of the surface error triangle, Vojtech's formula.
+// H = 1.44 × max_surface_deviation × sqrt(n_sin / n_cos)
 //    return (face.n_cos > 1e-5) ? float(1.44 * max_surface_deviation * sqrt(face.n_sin / face.n_cos)) : FLT_MAX;
 
-// Constant error measured as an area of the surface error triangle, Vojtech's formula with clamping to roughness at 90 degrees.
+// Constant error measured as an area of the surface error triangle, Vojtech's formula
+// with an upper clamp at roughness measured at 90 degrees (near-vertical surfaces).
+// The factor 0.184 is the empirical roughness constant from Wasserfall's paper.
     return std::min(max_surface_deviation / 0.184f, (face.n_cos > 1e-5) ? float(1.44 * max_surface_deviation * sqrt(face.n_sin / face.n_cos)) : FLT_MAX);
 
-// Constant stepping along the surface, equivalent to the "surface roughness" metric by Perez and later Pandey et all, see @platch's paper for references.
+// Constant stepping along the surface ("surface roughness" metric by Perez, Pandey et al).
+// H = max_surface_deviation × n_sin
 //    return float(max_surface_deviation * face.n_sin);
 }
 
@@ -107,10 +116,21 @@ void SlicingAdaptive::prepare(const ModelObject &object)
 	std::sort(m_faces.begin(), m_faces.end(), [](const FaceZ &f1, const FaceZ &f2) { return f1.z_span < f2.z_span; });
 }
 
-// current_facet is in/out parameter, rememebers the index of the last face of m_faces visited, 
-// where this function will start from.
-// print_z - the top print surface of the previous layer.
-// returns height of the next layer.
+// current_facet is in/out: on entry it is the index of the first face that could be
+// relevant for this layer (faces are sorted by z_span.first, so all faces with
+// z_span.first < print_z are already behind us).  On exit it is updated to the first
+// face that straddles print_z, so the next call can resume from there.
+//
+// Algorithm:
+//  1. Convert quality_factor → max_surface_deviation using piecewise linear mapping:
+//       quality 0   → min_layer_height (finest quality)
+//       quality 0.5 → layer_height     (default)
+//       quality 1   → max_layer_height (fastest)
+//  2. Scan faces whose z_span straddles print_z; for each, compute the max height
+//     allowed by that face's slope and keep the minimum.
+//  3. Clamp to [min_layer_height, max_layer_height].
+//  4. Lookahead: scan faces that START within the proposed layer.  If any of them
+//     require a smaller height, shrink the layer and repeat the clamp.
 float SlicingAdaptive::next_layer_height(const float print_z, float quality_factor, size_t &current_facet)
 {
 	float  height = (float)m_slicing_params.max_layer_height;
